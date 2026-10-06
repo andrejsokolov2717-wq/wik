@@ -1,0 +1,8 @@
+Website = "https://github.com/sweepy-app/sweepy"
+
+[Details]
+  Icon = "Icon.png"
+  Name = "Sweepy"
+  ID = "com.sweepy.app"
+  Version = "1.0.0"
+  Build = 1
