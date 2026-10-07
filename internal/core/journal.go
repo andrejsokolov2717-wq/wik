@@ -28,9 +28,16 @@ type Journal struct {
 	mu       sync.Mutex
 	path     string
 	Sessions []Session `json:"sessions"`
+
+	// RecoveredBackup — путь к карантиновому файлу, в который переехал
+	// повреждённый журнал при загрузке (пусто, если всё было в порядке).
+	RecoveredBackup string `json:"-"`
 }
 
 // OpenJournal загружает журнал из path; если файла нет — создаёт пустой.
+// Битый JSON не роняет приложение: повреждённый файл сохраняется рядом
+// (journal.json.bad-<ts>) и стартует чистый журнал — RecoveredBackup
+// сообщает UI, что нужен диалог восстановления.
 func OpenJournal(path string) (*Journal, error) {
 	j := &Journal{path: path}
 	data, err := os.ReadFile(path)
@@ -41,10 +48,23 @@ func OpenJournal(path string) (*Journal, error) {
 		return nil, err
 	}
 	if err := json.Unmarshal(data, j); err != nil {
-		return nil, fmt.Errorf("журнал повреждён: %w", err)
+		bak := quarantine(path, "bad")
+		_ = bak // даже если сохранить бэкап не удалось — стартуем с пустым журналом
+		fresh := &Journal{path: path, RecoveredBackup: bak}
+		return fresh, nil
 	}
 	j.path = path
 	return j, nil
+}
+
+// quarantine переименовывает повреждённый файл в "<path>.<tag>-<unix>".
+// Возвращает путь карантина (или "" при неудаче).
+func quarantine(path, tag string) string {
+	bak := fmt.Sprintf("%s.%s-%d", path, tag, time.Now().Unix())
+	if err := os.Rename(path, bak); err != nil {
+		return ""
+	}
+	return bak
 }
 
 // Add записывает сессию в журнал и сохраняет его на диск.
@@ -98,6 +118,20 @@ func (j *Journal) LastActive() *Session {
 		}
 	}
 	return nil
+}
+
+// RecentActive возвращает до n последних неоткаченных сессий, новые первыми.
+func (j *Journal) RecentActive(n int) []*Session {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var out []*Session
+	for i := len(j.Sessions) - 1; i >= 0 && len(out) < n; i-- {
+		if !j.Sessions[i].Undone {
+			cp := j.Sessions[i]
+			out = append(out, &cp)
+		}
+	}
+	return out
 }
 
 // byID возвращает актуальную копию сессии из журнала (или nil).

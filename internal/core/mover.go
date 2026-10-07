@@ -1,7 +1,7 @@
 package core
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -11,13 +11,17 @@ import (
 	"time"
 )
 
+// errBusy — уборка/откат уже выполняется (UI и сторож сериализованы).
+var errBusy = errors.New("уборка уже выполняется, подождите")
+
 // Mover выполняет и откатывает планы.
 // Жёсткое правило безопасности: здесь НЕТ ни одного вызова удаления
 // пользовательских файлов — только os.Rename (перемещение).
 // Исключения: недописанная копия при междисковом переносе и опустевшие
 // папки категорий после отката.
 // Методы сериализованы мьютексом: UI и фоновый сторож не могут
-// перемещать файлы одновременно.
+// перемещать файлы одновременно. TryLock используется, чтобы долгая
+// операция сторожа не блокировала поток UI намертво.
 type Mover struct {
 	mu      sync.Mutex
 	Journal *Journal
@@ -30,12 +34,18 @@ func NewMover(j *Journal, st *Stats) *Mover {
 }
 
 // Execute применяет план: перемещает файлы и пишет сессию в журнал.
+// Если другая операция идёт прямо сейчас — вернёт errBusy.
 // При ошибке на N-м файле уже перемещённые файлы остаются в журнале
 // и доступны для отката — частичная уборка не теряется.
 func (m *Mover) Execute(plan *Plan) (done int, err error) {
-	m.mu.Lock()
+	if !m.mu.TryLock() {
+		return 0, errBusy
+	}
 	defer m.mu.Unlock()
+	return m.executeLocked(plan)
+}
 
+func (m *Mover) executeLocked(plan *Plan) (done int, err error) {
 	if len(plan.Moves) == 0 {
 		return 0, nil
 	}
@@ -70,10 +80,16 @@ func (m *Mover) Execute(plan *Plan) (done int, err error) {
 
 // Undo откатывает сессию: возвращает каждый файл на исходное место.
 // Файлы, которые пользователь уже переименовал/убрал вручную, пропускаются.
+// Если другая операция идёт прямо сейчас — вернёт errBusy.
 func (m *Mover) Undo(sess *Session) (restored, missing int, err error) {
-	m.mu.Lock()
+	if !m.mu.TryLock() {
+		return 0, 0, errBusy
+	}
 	defer m.mu.Unlock()
+	return m.undoLocked(sess)
+}
 
+func (m *Mover) undoLocked(sess *Session) (restored, missing int, err error) {
 	// состояние отката смотрим в журнале — переданная сессия может быть
 	// устаревшей копией
 	if fresh := m.Journal.byID(sess.ID); fresh != nil {
@@ -165,6 +181,6 @@ func removeEmptyDirs(sess *Session) {
 
 func newID() string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	_, _ = crand.Read(b)
 	return fmt.Sprintf("%x-%d", b, time.Now().Unix())
 }
