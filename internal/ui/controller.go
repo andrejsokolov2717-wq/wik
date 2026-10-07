@@ -23,8 +23,20 @@ type Controller struct {
 	Mover   *core.Mover
 	Watcher *watcher.Watcher
 
-	mu   sync.RWMutex
-	cats []core.Category
+	mu        sync.RWMutex
+	cats      []core.Category
+	watcherMu sync.Mutex // сериализует перезапуск сторожа (гонка Stop/Start)
+
+	// onLanguage — колбэк перестройки UI при смене языка (ставит app.go).
+	onLanguage func()
+}
+
+// OnLanguage регистрирует колбэк полной перестройки интерфейса
+// при смене языка — вызывается из потока UI.
+func (c *Controller) OnLanguage(fn func()) {
+	c.mu.Lock()
+	c.onLanguage = fn
+	c.mu.Unlock()
 }
 
 // NewController собирает сервисы приложения.
@@ -95,10 +107,16 @@ func (c *Controller) Language() i18n.Lang {
 	return i18n.Current()
 }
 
-// SetLanguage сохраняет и применяет язык.
+// SetLanguage сохраняет и применяет язык, перестраивая интерфейс на лету.
 func (c *Controller) SetLanguage(l i18n.Lang) {
 	i18n.Set(l)
 	c.App.Preferences().SetString("lang", string(l))
+	c.mu.RLock()
+	fn := c.onLanguage
+	c.mu.RUnlock()
+	if fn != nil {
+		fyne.Do(fn) // поток UI: полная перерисовка вкладок
+	}
 }
 
 // TargetDir — текущая целевая папка из настроек.
@@ -123,21 +141,28 @@ func (c *Controller) SetTarget(mode, customPath string) {
 }
 
 // StartWatcher / StopWatcher — управление фоновым сторожем целевой папки.
+// watcherMu сериализует перезапуск: два одновременных Start не могут
+// оставить «мёртвый» watcher-экземпляр, записанный в поле.
 func (c *Controller) StartWatcher() error {
+	c.watcherMu.Lock()
+	defer c.watcherMu.Unlock()
 	dir := c.TargetDir()
 	if c.Watcher != nil && c.Watcher.Running() {
 		c.Watcher.Stop()
 	}
-	c.Watcher = watcher.New(dir, c.Mover, c.Scanner, c.Categories)
-	if err := c.Watcher.Start(); err != nil {
+	w := watcher.New(dir, c.Mover, c.Scanner, c.Categories)
+	if err := w.Start(); err != nil {
 		c.App.Preferences().SetBool("watch_enabled", false)
 		return err
 	}
+	c.Watcher = w // поле обновляем только успешно запущенным сторожем
 	c.App.Preferences().SetBool("watch_enabled", true)
 	return nil
 }
 
 func (c *Controller) StopWatcher() {
+	c.watcherMu.Lock()
+	defer c.watcherMu.Unlock()
 	if c.Watcher != nil {
 		c.Watcher.Stop()
 	}
@@ -147,4 +172,16 @@ func (c *Controller) StopWatcher() {
 // WatcherEnabled — сохранённая настройка сторожа.
 func (c *Controller) WatcherEnabled() bool {
 	return c.App.Preferences().Bool("watch_enabled")
+}
+
+// OpenTarget открывает текущую целевую папку в файловом менеджере ОС.
+func (c *Controller) OpenTarget() error {
+	return core.OpenFolder(c.TargetDir())
+}
+
+// RecentSessions — до n последних неоткаченных сессий (новые первыми).
+// Используется диалогом «Отменить…», чтобы выбрать конкретную уборку,
+// а не только последнюю.
+func (c *Controller) RecentSessions(n int) []*core.Session {
+	return c.Journal.RecentActive(n)
 }

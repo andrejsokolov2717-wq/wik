@@ -3,6 +3,7 @@ package watcher
 
 import (
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -11,8 +12,16 @@ import (
 	"sweepy/internal/core"
 )
 
+// sizeStamp — снимок размера файла для проверки «дописался ли».
+type sizeStamp struct {
+	size int64
+	when time.Time
+}
+
 // Watcher — фоновый сторож «Загрузок»: новый файл раскладывается
 // через quiet-период после последнего изменения (дебаунс записи).
+// Дополнительно убеждается, что размер файла не меняется (загрузка
+// завершена), и пропускает временные файлы браузеров (.part и т.п.).
 type Watcher struct {
 	Dir     string
 	Quiet   time.Duration // пауза после последней записи, по умолчанию 5 сек
@@ -21,25 +30,27 @@ type Watcher struct {
 	Cats    func() []core.Category // актуальные категории из настроек
 	OnTidy  func(m core.Move)      // колбэк для UI/лога
 
-	fsw     *fsnotify.Watcher
-	mu      sync.Mutex
-	pending map[string]time.Time
-	stop    chan struct{}
-	done    chan struct{}
-	running bool
+	fsw      *fsnotify.Watcher
+	mu       sync.Mutex
+	pending  map[string]time.Time
+	lastSize map[string]sizeStamp
+	stop     chan struct{}
+	done     chan struct{}
+	running  bool
 }
 
 // New создаёт сторож для каталога dir.
 func New(dir string, mover *core.Mover, scanner *core.Scanner, cats func() []core.Category) *Watcher {
 	return &Watcher{
-		Dir:     dir,
-		Quiet:   5 * time.Second,
-		Mover:   mover,
-		Scanner: scanner,
-		Cats:    cats,
-		pending: map[string]time.Time{},
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		Dir:      dir,
+		Quiet:    5 * time.Second,
+		Mover:    mover,
+		Scanner:  scanner,
+		Cats:     cats,
+		pending:  map[string]time.Time{},
+		lastSize: map[string]sizeStamp{},
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -56,19 +67,24 @@ func (w *Watcher) Start() error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(w.Dir, 0o755); err != nil {
+		fsw.Close()
+		return err
+	}
 	if err := fsw.Add(w.Dir); err != nil {
 		fsw.Close()
 		return err
 	}
-	w.fsw = fsw
+
 	w.mu.Lock()
+	w.fsw = fsw
 	w.running = true
 	w.mu.Unlock()
 	go w.loop()
 	return nil
 }
 
-// Stop останавливает сторож.
+// Stop останавливает сторож. Повторный вызов безопасен.
 func (w *Watcher) Stop() {
 	w.mu.Lock()
 	if !w.running {
@@ -76,13 +92,25 @@ func (w *Watcher) Stop() {
 		return
 	}
 	w.running = false
+	stop := w.stop
+	fsw := w.fsw
+	done := w.done
 	w.mu.Unlock()
-	close(w.stop)
-	<-w.done
-	w.fsw.Close()
-	// сброс каналов для возможного перезапуска
+
+	close(stop)
+	<-done // ждём выхода цикла loop()
+	if fsw != nil {
+		fsw.Close() // закрываем после выхода цикла: safe для pending-обработок
+	}
+
+	w.mu.Lock()
+	// сброс каналов и карт для возможного перезапуска
 	w.stop = make(chan struct{})
 	w.done = make(chan struct{})
+	w.pending = map[string]time.Time{}
+	w.lastSize = map[string]sizeStamp{}
+	w.fsw = nil
+	w.mu.Unlock()
 }
 
 // Running сообщает, активен ли сторож.
@@ -122,6 +150,8 @@ func (w *Watcher) loop() {
 }
 
 // flush раскладывает все файлы, чьё «затишье» превысило Quiet, одним планом.
+// Файл считается готовым, если за Quiet-период к нему не было записей
+// И его размер не меняется между двумя проверками (загрузка завершилась).
 func (w *Watcher) flush() {
 	w.mu.Lock()
 	now := time.Now()
@@ -135,11 +165,39 @@ func (w *Watcher) flush() {
 			delete(w.pending, name)
 		}
 	}
+	last := w.lastSize
 	w.mu.Unlock()
 
 	if len(readySet) == 0 {
 		return
 	}
+	// проверка стабильности размера: файл, который всё ещё растёт,
+	// возвращается в pending и получит ещё один quiet-период
+	for name := range readySet {
+		st, err := os.Stat(name)
+		if err != nil || !st.Mode().IsRegular() {
+			delete(readySet, name) // исчез / стал папкой — снимаем с контроля
+			w.mu.Lock()
+			delete(last, name)
+			w.mu.Unlock()
+			continue
+		}
+		w.mu.Lock()
+		prev, seen := last[name]
+		last[name] = sizeStamp{size: st.Size(), when: now}
+		w.mu.Unlock()
+		if seen && prev.size == st.Size() {
+			continue // размер не изменился — файл дописан
+		}
+		delete(readySet, name) // ещё пишется — ждём дальше
+		w.mu.Lock()
+		w.pending[name] = now
+		w.mu.Unlock()
+	}
+	if len(readySet) == 0 {
+		return
+	}
+
 	files, err := w.Scanner.Scan(w.Dir)
 	if err != nil {
 		log.Printf("sweepy watcher: %v", err)
@@ -163,6 +221,12 @@ func (w *Watcher) flush() {
 		log.Printf("sweepy watcher: %v", err)
 		return
 	}
+	// после переноса снимаем файлы из наблюдения по размеру
+	w.mu.Lock()
+	for name := range readySet {
+		delete(last, name)
+	}
+	w.mu.Unlock()
 	for _, mv := range plan.Moves {
 		if w.OnTidy != nil {
 			w.OnTidy(mv)

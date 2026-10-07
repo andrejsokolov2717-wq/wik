@@ -17,6 +17,9 @@ type Stats struct {
 	FilesMoved  int            `json:"files_moved"`
 	BytesSorted int64          `json:"bytes_sorted"`
 	Days        map[string]int `json:"days"` // "2006-01-02" -> число файлов
+
+	// RecoveredBackup — путь к карантиновому файлу битой статистики.
+	RecoveredBackup string `json:"-"`
 }
 
 // Snapshot — неизменяемый снимок статистики для UI.
@@ -29,6 +32,8 @@ type Snapshot struct {
 }
 
 // OpenStats загружает статистику из path; если файла нет — создаёт пустую.
+// Битый JSON не роняет приложение: файл уходит в карантин, статистика
+// начинается заново (RecoveryNote сообщает об этом UI).
 func OpenStats(path string) (*Stats, error) {
 	s := &Stats{path: path, Days: map[string]int{}}
 	data, err := os.ReadFile(path)
@@ -39,7 +44,10 @@ func OpenStats(path string) (*Stats, error) {
 		return nil, err
 	}
 	if err := json.Unmarshal(data, s); err != nil {
-		return nil, fmt.Errorf("статистика повреждена: %w", err)
+		bak := quarantine(path, "bad")
+		_ = bak
+		fresh := &Stats{path: path, Days: map[string]int{}, RecoveredBackup: bak}
+		return fresh, nil
 	}
 	s.path = path
 	if s.Days == nil {

@@ -22,8 +22,8 @@ func homeTab(c *Controller) fyne.CanvasObject {
 	prefs := c.App.Preferences()
 
 	title := widget.NewLabelWithStyle("Sweepy", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	subtitle := widget.NewLabelWithStyle(i18n.T("home.subtitle"),
-		fyne.TextAlignCenter, fyne.TextStyle{})
+	subtitle := widget.NewLabel(i18n.T("home.subtitle"))
+	subtitle.Alignment = fyne.TextAlignCenter
 
 	// --- выбор целевой папки ---
 	optDownloads := i18n.T("home.downloads")
@@ -71,6 +71,7 @@ func homeTab(c *Controller) fyne.CanvasObject {
 			browseBtn.Hide()
 		}
 	})
+	targetRadio.Horizontal = true
 	switch prefs.StringWithFallback("target", "downloads") {
 	case "desktop":
 		targetRadio.SetSelected(optDesktop)
@@ -127,14 +128,45 @@ func homeTab(c *Controller) fyne.CanvasObject {
 	status.Wrapping = fyne.TextWrapWord
 
 	// --- кнопки действий ---
-	var scanBtn, tidyBtn, undoBtn, shareBtn *widget.Button
+	var scanBtn, tidyBtn, undoBtn, undoMoreBtn, shareBtn *widget.Button
 
 	setUndoState := func() {
-		if c.Journal.ActiveCount() > 0 {
+		n := c.Journal.ActiveCount()
+		if n > 0 {
 			undoBtn.Enable()
+			undoMoreBtn.Enable()
 		} else {
 			undoBtn.Disable()
+			undoMoreBtn.Disable()
 		}
+	}
+
+	// runTidy выполняет план в фоне и обновляет статус в потоке UI.
+	runTidy := func(planned *core.Plan) {
+		tidyBtn.Disable()
+		scanBtn.Disable()
+		status.SetText(i18n.T("home.working"))
+		go func() {
+			done, err := c.Mover.Execute(planned)
+			fyne.Do(func() {
+				scanBtn.Enable()
+				if err != nil {
+					dialog.ShowError(err, c.Window)
+				}
+				if done > 0 {
+					status.SetText(i18n.T("home.done", done, i18n.Plural(done, "file"),
+						core.FormatBytes(planned.TotalBytes())))
+					shareBtn.Enable()
+				} else {
+					status.SetText(i18n.T("home.statusStart"))
+				}
+				plan = nil
+				table.Hide()
+				previewHeader.Hide()
+				table.Refresh()
+				setUndoState()
+			})
+		}()
 	}
 
 	tidyBtn = widget.NewButtonWithIcon(i18n.T("home.tidy"), theme.ConfirmIcon(), func() {
@@ -146,37 +178,42 @@ func homeTab(c *Controller) fyne.CanvasObject {
 			i18n.T("home.confirmMoveTitle", len(planned.Moves), i18n.Plural(len(planned.Moves), "file")),
 			i18n.T("home.confirmMoveBody"),
 			func(ok bool) {
-				if !ok {
-					return
+				if ok {
+					runTidy(planned)
 				}
-				tidyBtn.Disable()
-				scanBtn.Disable()
-				status.SetText(i18n.T("home.working"))
-				go func() {
-					done, err := c.Mover.Execute(planned)
-					fyne.Do(func() {
-						scanBtn.Enable()
-						if err != nil {
-							dialog.ShowError(err, c.Window)
-						}
-						if done > 0 {
-							status.SetText(i18n.T("home.done", done, i18n.Plural(done, "file"),
-								core.FormatBytes(planned.TotalBytes())))
-							shareBtn.Enable()
-						} else {
-							status.SetText(i18n.T("home.statusStart"))
-						}
-						plan = nil
-						table.Hide()
-						previewHeader.Hide()
-						table.Refresh()
-						setUndoState()
-					})
-				}()
 			}, c.Window)
 	})
 	tidyBtn.Importance = widget.HighImportance
 	tidyBtn.Disable()
+
+	// undoSession — откат конкретной сессии с обновлением статуса.
+	undoSession := func(sess *core.Session) {
+		go func() {
+			restored, missing, err := c.Mover.Undo(sess)
+			fyne.Do(func() {
+				if err != nil {
+					dialog.ShowError(err, c.Window)
+				}
+				msg := i18n.T("home.restored", restored, i18n.Plural(restored, "file"))
+				if missing > 0 {
+					msg += i18n.T("home.restoredMissing", missing)
+				}
+				status.SetText(msg)
+				setUndoState()
+			})
+		}()
+	}
+
+	confirmUndo := func(sess *core.Session) {
+		dialog.ShowConfirm(i18n.T("home.undoConfirmTitle"),
+			i18n.T("home.undoConfirmBody", len(sess.Moves), i18n.Plural(len(sess.Moves), "file"),
+				sess.StartedAt.Format("02.01.2006 15:04")),
+			func(ok bool) {
+				if ok {
+					undoSession(sess)
+				}
+			}, c.Window)
+	}
 
 	undoBtn = widget.NewButtonWithIcon(i18n.T("home.undo"), theme.ContentUndoIcon(), func() {
 		sess := c.Journal.LastActive()
@@ -184,28 +221,42 @@ func homeTab(c *Controller) fyne.CanvasObject {
 			status.SetText(i18n.T("home.nothingToUndo"))
 			return
 		}
-		dialog.ShowConfirm(i18n.T("home.undoConfirmTitle"),
-			i18n.T("home.undoConfirmBody", len(sess.Moves), i18n.Plural(len(sess.Moves), "file"),
-				sess.StartedAt.Format("02.01.2006 15:04")),
-			func(ok bool) {
-				if !ok {
-					return
-				}
-				go func() {
-					restored, missing, err := c.Mover.Undo(sess)
-					fyne.Do(func() {
-						if err != nil {
-							dialog.ShowError(err, c.Window)
-						}
-						msg := i18n.T("home.restored", restored, i18n.Plural(restored, "file"))
-						if missing > 0 {
-							msg += i18n.T("home.restoredMissing", missing)
-						}
-						status.SetText(msg)
-						setUndoState()
-					})
-				}()
-			}, c.Window)
+		confirmUndo(sess)
+	})
+
+	// undoMoreBtn — выбор конкретной уборки из журнала: обещание README
+	// про откат любой прошлой сессии теперь доступно прямо в UI.
+	undoMoreBtn = widget.NewButtonWithIcon(i18n.T("home.undoPick"), theme.ListIcon(), func() {
+		sessions := c.RecentSessions(10)
+		if len(sessions) == 0 {
+			status.SetText(i18n.T("home.nothingToUndo"))
+			return
+		}
+		list := widget.NewList(
+			func() int { return len(sessions) },
+			func() fyne.CanvasObject { return widget.NewLabel("") },
+			func(id widget.ListItemID, obj fyne.CanvasObject) {
+				s := sessions[id]
+				obj.(*widget.Label).SetText(i18n.T("home.undoEntry",
+					s.StartedAt.Format("02.01.2006 15:04"),
+					len(s.Moves), i18n.Plural(len(s.Moves), "file")))
+			},
+		)
+		d := dialog.NewCustom(i18n.T("home.undoPickTitle"),
+			widget.NewButtonWithIcon(i18n.T("home.cancel"), theme.CancelIcon(), func() { d.Hide() }),
+			container.NewPadded(list), c.Window)
+		list.OnSelected = func(id widget.ListItemID) {
+			d.Hide()
+			confirmUndo(sessions[id])
+		}
+		d.Resize(fyne.NewSize(420, 380))
+		d.Show()
+	})
+
+	openFolderBtn := widget.NewButtonWithIcon(i18n.T("home.openFolder"), theme.FolderOpenIcon(), func() {
+		if err := c.OpenTarget(); err != nil {
+			status.SetText(i18n.T("home.openFolderError", err))
+		}
 	})
 
 	shareBtn = widget.NewButtonWithIcon(i18n.T("home.shareCard"), theme.MediaPhotoIcon(), func() {
@@ -252,11 +303,15 @@ func homeTab(c *Controller) fyne.CanvasObject {
 
 	scanBtn = widget.NewButtonWithIcon(i18n.T("home.scan"), theme.ViewRefreshIcon(), func() {
 		dir := c.TargetDir()
+		scanBtn.Disable()
+		status.SetText(i18n.T("home.scanning"))
 		go func() {
 			files, err := c.Scanner.Scan(dir)
 			fyne.Do(func() {
+				scanBtn.Enable()
 				if err != nil {
 					dialog.ShowError(fmt.Errorf("%s", i18n.T("home.scanError", dir, err)), c.Window)
+					status.SetText(i18n.T("home.statusStart"))
 					return
 				}
 				plan = core.BuildPlan(dir, files, c.Categories())
@@ -279,16 +334,16 @@ func homeTab(c *Controller) fyne.CanvasObject {
 
 	targetBox := container.NewVBox(
 		widget.NewLabelWithStyle(i18n.T("home.whatToTidy"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		targetRadio,
+		container.NewBorder(nil, nil, nil, openFolderBtn, targetRadio),
 		container.NewBorder(nil, nil, nil, browseBtn, customLabel),
 	)
-	actions := container.NewHBox(scanBtn, undoBtn, shareBtn)
+	actions := container.NewHBox(scanBtn, undoBtn, undoMoreBtn, shareBtn)
 
 	setUndoState()
 
 	return container.NewBorder(
-		container.NewVBox(title, subtitle, targetBox, actions, tidyBtn, status, previewHeader),
+		container.NewPadded(container.NewVBox(title, subtitle, targetBox, actions, tidyBtn, status, previewHeader)),
 		nil, nil, nil,
-		table,
+		container.NewPadded(table),
 	)
 }
